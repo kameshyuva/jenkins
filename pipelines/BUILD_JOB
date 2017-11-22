@@ -1,0 +1,155 @@
+pipeline {
+    // Possible agent configurations - you must have one and only one at the top level.
+    agent any
+
+    // Access parameters with 'params.PARAM_NAME' - that'll get you default values too.
+    parameters {
+        string(defaultValue: 'package', description: 'mvn goals', name: 'MVN_GOAL')
+    }
+
+    options {
+        // General Jenkins job properties
+        buildDiscarder(logRotator(daysToKeepStr: '5'))
+        // Declarative-specific options
+        skipDefaultCheckout()
+        disableConcurrentBuilds()
+        // "wrapper" steps that should wrap the entire build execution.
+        // Edit Timestamper in Jenkins settings to set the required format.
+        timestamps()
+        timeout(time: 1, unit: 'HOURS')
+    }
+
+    triggers {
+        pollSCM('H/60 * * * *')
+    }
+
+    environment {
+        ui_folder = "${WORKSPACE}/src/main/FOLDER"
+        //def svn_revision = sh(returnStdout: true, script: 'svn info -r HEAD| grep "Last Changed Rev" | egrep -o "[0-9]+"').trim()
+        //EMAIL TEMPLATE
+        def content = '${SCRIPT, template="groovy-custom-html.template"}'
+        def TYPE = 'snapshots'
+        def APPLICATION = 'APPNAME'
+        def SCM_BRANCH_URL = 
+        def SNAPSHOT_JOB = 'SNAPSHOTS_JOB'
+        def EMAIL_LIST = 'abc@def.com,abc@def.com,abc@def.com'
+    }
+
+    stages {
+        stage('Checkout'){
+            steps{
+                checkout([$class: 'SubversionSCM',
+                          additionalCredentials: [],
+                          excludedCommitMessages: '',
+                          excludedRegions: '',
+                          excludedRevprop: '',
+                          excludedUsers: '',
+                          filterChangelog: false,
+                          ignoreDirPropChanges: false,
+                          includedRegions: '',
+                          locations: [[credentialsId: 'c9a25c8d-1705-4a66-861d-d64025fc5901',
+                                       depthOption: 'infinity',
+                                       ignoreExternalsOption: true,
+                                       local: '.',
+                                       remote: "${env.SCM_BRANCH_URL}"
+                                      ]],
+                          workspaceUpdater: [$class: 'UpdateUpdater']])
+            }
+        }
+
+        stage('Initialize') {
+            steps {
+                sh '''
+					echo "PATH = ${PATH}"
+					echo "M2_HOME = ${M2_HOME}"
+					mvn --version
+					
+					#need to delete .svn folder as node_modules are checked in to project folder.
+					find $ui_folder/node_modules -mindepth 1 -type d -name '\\.svn' | xargs -I{} rm -rf {}
+		              
+		            #npm config set proxy=""
+                    #npm config set registry ""
+		            #npm install
+		            #ng build --prod --no-progress --output-path=../../../dist --base-href=/appname/
+				'''
+            }
+        }
+
+       stage('Build Angular/Java') {
+            steps {
+                sh "mvn -B -U -Dmaven.test.failure.ignore=true ${MVN_GOAL}"
+            }
+        }
+
+        stage('Archive artifacts, Notify') {
+            steps {
+                archiveArtifacts(
+                        artifacts: 'target/*.war'
+                        //archive (includes: 'target/*.war')
+                )
+                emailext(
+                        to: "${env.EMAIL_LIST}",
+                        subject: env.APPLICATION.toUpperCase() + " BUILD : JOB ${env.JOB_NAME} #${env.BUILD_NUMBER} : SUCCESS",
+                        mimeType: "text/html",
+                        body: env.content
+                )
+            }
+        }
+
+        stage('Promote build as snapshot to Artifactory and Deploy to ENV1 ?') {
+            steps {
+                script {
+                    def userInput = true
+                    def didTimeout = false
+                    try {
+                        timeout(time: 15, unit: 'MINUTES') {
+                            env.PROMOTE_BUILD = input message: 'User input required',
+                                    parameters: [
+                                            choice(name: 'Promote build as snapshot to Artifactory?',
+                                                    choices: 'no\nyes',
+                                                    description: 'Choose "yes" if you want to promote this build as snapshot to Artifactory')
+                                    ]
+                        }
+                    } catch (err) { // timeout reached or input false
+                        def user = err.getCauses()[0].getUser()
+                        if ('SYSTEM' == user.toString()) { // SYSTEM means timeout.
+                            didTimeout = true
+                        } else {
+                            userInput = false
+                            echo "Aborted by: [${user}]"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('RepoENV1ory upload and ENV1 deployment') {
+            when {
+                environment name: 'PROMOTE_BUILD', value: 'yes'
+            }
+            steps {
+                script {
+                    env.branchMajorMinor = env.SCM_BRANCH_URL.split("/")[-1]
+                }
+                build job: "${env.SNAPSHOT_JOB}", parameters: [
+                        [$class: 'StringParameterValue', name: 'APPLICATION', value: env.APPLICATION],
+                        [$class: 'StringParameterValue', name: 'TYPE', value: env.TYPE],
+                        [$class: 'StringParameterValue', name: 'BUILD_JOB_NUMBER', value: env.BUILD_NUMBER],
+                        [$class: 'StringParameterValue', name: 'BRANCH_MAJOR_MINOR', value: env.branchMajorMinor]
+                ]
+            }
+        }
+
+    }
+
+    post {
+        failure {
+            emailext(
+                    to: "${env.EMAIL_LIST}",
+                    subject: env.APPLICATION.toUpperCase() + " BUILD : JOB ${env.JOB_NAME} #${env.BUILD_NUMBER} : FAILURE",
+                    mimeType: "text/html",
+                    body: env.content
+            )
+        }
+    }
+}
