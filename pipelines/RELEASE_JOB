@@ -1,0 +1,196 @@
+pipeline {
+    // Possible agent configurations - you must have one and only one at the top level.
+    agent any
+
+    // Access parameters with 'params.PARAM_NAME' - that'll get you default values too.
+    parameters {
+        choice(name: 'APPLICATION', choices: 'app1\napp2\napp3\napp4', description: 'Application name')
+        string(name: 'SCM_BRANCH', defaultValue: '', description: 'This is the Release Branch name')
+        string(name: 'BETA_VER', defaultValue: '',
+                description: 'Only for release.\n' +
+                        'beta version number format : majorver.minorver.counter\n'
+        string(name: 'SNAPSHOT_VER', defaultValue: '',
+                description: 'Only for service commons.\n' +
+                        'snapshot version number format : majorver.minorver.counter-SNAPSHOT\n' +
+                        '(Refer Artifactory libs-snapshot-local repo)')
+        string(name: 'RELEASE_VER', defaultValue: '',
+                description: 'Only for release.\n' +
+                        'If left blank, release version is set to the next version of the latest available release from Artifactory')
+    }
+
+    options {
+        // General Jenkins job properties
+        buildDiscarder(logRotator(daysToKeepStr: '5'))        
+        disableConcurrentBuilds()
+        //skipDefaultCheckout()
+        // "wrapper" steps that should wrap the entire build execution.
+        // Edit Timestamper in Jenkins settings to set the required format.
+        timestamps()
+        timeout(time: 1, unit: 'HOURS')
+    }
+
+    environment {
+        def releaseRepo = "repo-release"
+        def betaRepo = "repo-beta"
+        def snapshotRepo = "repo-snapshots"
+        def releaseMvnRepo = "libs-release-local"
+        def snapshotMvnRepo = "libs-snapshot-local"
+
+        def appReleaseRepoPath = "${releaseRepo}" + '/' + "${params.APPLICATION}"
+        def appBetaRepoPath = "${betaRepo}" + '/' + "${params.APPLICATION}"
+        def appSnapshotRepoPath = "${snapshotRepo}" + '/' + "${params.APPLICATION}"
+        def TYPE = "${params.APPLICATION == 'app4' ? 'snapshot' : 'release'}"
+        //EMAIL TEMPLATE - placed in JENKINS_HOME/email-templates - JENKINS_HOME/email-templates
+        //def content = '${SCRIPT, template="groovy-custom-html.template"}'
+        
+        def DEPLOY_JOB_NAME = 'DEPLOY_JOB'
+        def EMAIL_LIST = 'abc@def.com,abc@def.com,abc@def.com'
+    }
+
+    stages {
+
+        stage('Validate input params') {
+            steps {
+                script {
+                    if (params.APPLICATION == '') {
+                        sh(returnStdout: true, script: "echo 'Missing param : APPLICATION' && exit 1")
+                    }
+                    else if (params.SCM_BRANCH == '') {
+                        sh(returnStdout: true, script: "echo 'Missing param: SCM_BRANCH cannot be empty' && exit 1")
+                    }
+                    else if (params.BETA_VER == '' && params.SNAPSHOT_VER == '') {
+                        sh(returnStdout: true, script: "echo 'Insufficient parameters, Provide beta version to promote to release repo' && exit 1")
+                    }
+                }
+            }
+        }
+
+        stage('Promote Application Beta to Release in Repository') {
+            when {
+                allOf {
+                    environment name: 'TYPE', value: 'release'
+                    expression { params.BETA_VER != '' }
+                    expression { params.APPLICATION != 'app4' }
+                }
+            }
+            steps {
+                script {
+                    def server = Artifactory.server 'REPO'
+                    env.artUrl = server.url.toString()
+
+                    //Download the version from Artifactory
+                    def downloadFile = env.appBetaRepoPath + '/' + params.BETA_VER + '/' + params.APPLICATION + '.war'
+                    def downloadPath = params.BETA_VER + '/'
+                    def downloadSpec = """{
+                        "files": [
+                            {
+                            "pattern": "${downloadFile}",
+                            "target": "${downloadPath}",
+                            "flat" : true
+                            }
+                        ]
+                    }"""
+                    def downloadBuildInfo = server.download(downloadSpec)
+
+                    def releaseMajMinor = RELEASE_VER.split('\\.')[0..<-1].join('.') 
+                    if (params.RELEASE_VER == '' || params.SCM_BRANCH != releaseMajMinor) {
+                        env.RELEASE_VER = params.SCM_BRANCH + '-RELEASE'
+                    }
+
+                    def uploadFile = downloadPath + params.APPLICATION + '.war'
+
+                    //Upload the version as release
+                    def releaseUploadPath = env.appReleaseRepoPath + '/' + env.RELEASE_VER + '/'
+                    def releaseUploadSpec = """{
+					 "files": [
+						   {
+							   "pattern": "${uploadFile}" ,
+							   "target": "${releaseUploadPath}"
+						   }
+						]
+				    }"""
+                    def releaseBuildInfo = server.upload(releaseUploadSpec)
+                    server.publishBuildInfo(releaseBuildInfo)
+                }
+            }
+        }
+
+        stage('Promote Service commons Snapshot to Release in Repository') {
+            when {
+                allOf {
+                    environment name: 'TYPE', value: 'snapshot'
+                    expression { params.SNAPSHOT_VER != '' }
+                    expression { params.APPLICATION == 'app4' }
+                }
+            }
+            steps {
+                script {
+                    def server = Artifactory.server 'REPO'
+                    env.artUrl = server.url.toString()                     
+                    env.appName = params.APPLICATION.toString().split('/')[-1]
+                    env.appRepoUrl = env.artUrl + '/' + env.snapshotMvnRepo + '/' + params.APPLICATION
+
+                    //download maven snapshot artifact
+                    withCredentials([usernamePassword(credentialsId: 'artifactoryAdmin',passwordVariable: 'ARTIFACTORY_USER_PASSWORD',usernameVariable: 'ARTIFACTORY_USER')]) {
+                        sh '''
+                            set +e
+                            mkdir -p ${SNAPSHOT_VER}
+                            curl -sS -k -u ${ARTIFACTORY_USER}:${ARTIFACTORY_USER_PASSWORD} "${appRepoUrl}/${SNAPSHOT_VER}/maven-metadata.xml" > .mvnMetaDataXml                                
+                            appShellVer=`python -c 'import sys;from lxml import etree;print etree.parse(".mvnMetaDataXml").find("versioning").find("snapshotVersions").find("snapshotVersion").find("value").text'`
+                            curl -sS -k -u ${ARTIFACTORY_USER}:${ARTIFACTORY_USER_PASSWORD} ${appRepoUrl}/${SNAPSHOT_VER}/${appName}-\$appShellVer.war > ${SNAPSHOT_VER}/${appName}.war
+                        '''
+                    }
+
+                    //upload as relase to maven relase repo
+                    env.groupId = params.APPLICATION.toString().split('/')[0..<-1].join('.')
+                    env.artifactId = env.appName
+                    env.RELEASE_VER = params.RELEASE_VER == '' ? params.SNAPSHOT_VER.toString().replaceAll(/-SNAPSHOT/,'-RELEASE') : params.RELEASE_VER
+                    sh """
+                        mvn -B deploy:deploy-file \
+                            -Durl="${artUrl}/${releaseMvnRepo}" \
+                            -DrepositoryId="central" \
+                            -Dfile="${WORKSPACE}/${SNAPSHOT_VER}/${appName}.war" \
+                            -DgroupId="${groupId}" \
+                            -DartifactId="${artifactId}" \
+                            -Dversion="${RELEASE_VER}" \
+                            -Dpackaging="war"
+                    """
+                }
+            }
+        }
+
+        stage('Email Notification') {
+            steps {
+                script {
+                    def type = 'release'
+                    def environment = 'prod'                    
+                    def deployJobBaseUrl = env.JENKINS_URL + 'job/'+ env.DEPLOY_JOB_NAME +'/buildWithParameters?'
+                    def deployLink = deployJobBaseUrl + '&APPLICATION=' + params.APPLICATION + 
+                                       '&SCM_BRANCH=' + params.SCM_BRANCH +
+                                       '&ENVIRONMENT=' + environment + '&TYPE=' + type +
+                                       '&VERSION=' + env.RELEASE_VER
+                    env.content = "<br>Release version <b>${env.RELEASE_VER}</b> staged !!" +
+                            "<br>Release to PROD : "
+                    content = content + '<a href="' + deployLink + '&cause=DEPLOY_' + env.RELEASE_VER + '"/>' + env.RELEASE_VER + '</a>'
+
+                    emailext(
+                            to: env.EMAIL_LIST,
+                            subject: params.APPLICATION.toUpperCase() + " RELEASE VERSIONING : JOB ${env.JOB_NAME} #${env.BUILD_NUMBER} : SUCCESS",
+                            mimeType: "text/html",
+                            body: content
+                    )
+                }
+            }
+        }
+    }
+    post {
+        failure {
+            emailext(
+                    to: "${env.EMAIL_LIST}",
+                    subject: params.APPLICATION.toUpperCase() + " RELEASE VERSIONING : JOB ${env.JOB_NAME} #${env.BUILD_NUMBER} : FAILURE",
+                    body: "Build #${env.BUILD_NUMBER} failed. \n Check console output: ${env.BUILD_URL}"
+            )
+        }
+    }
+}
+
