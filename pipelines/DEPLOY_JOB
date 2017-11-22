@@ -19,9 +19,9 @@ pipeline {
                         'Currently used for rollbacks through remote builds.\n' +
                         '\n' +
                         'Example:\n' +
-                        'To rollback the deployed defective build 17.04.09 to previously deployed successful build 17.04.08 : pass parameter value as \n' +
-                        'ROLLBACK_17.04.09\n' +
-                        'Note: This will delete the defective build 17.04.09 from artifactory')        
+                        'To rollback the deployed defective build 1.01.05 to previously deployed successful build 1.01.04 : pass parameter value as \n' +
+                        'ROLLBACK_1.01.05\n' +
+                        'Note: This will delete the defective build 1.01.05 from artifactory')        
     }
 
     options {
